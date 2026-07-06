@@ -1,0 +1,5 @@
+anthropic
+openpyxl
+pdfplumber
+pypdfium2
+xlwings
