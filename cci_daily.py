@@ -30,6 +30,7 @@ import argparse
 import base64
 import datetime as dt
 import json
+import os
 import re
 import shutil
 import sys
@@ -67,9 +68,30 @@ SERIES_SHEETS = [
     ("Port Stockpile", None),
 ]
 
-# Sheets with a trailing self-computing block that lags one row behind the
-# value rows (extended by copying the previous value row's block down).
-LAGGING_BLOCKS = {"Thermal Coal Weekly": ("AR", "BK")}
+# Trailing AVERAGEIFS block on Thermal Coal Weekly ("Fenwei CCI Thermal Index
+# Weekly Average", cols AR:BK). Its values self-compute from the daily data,
+# but each row's date must follow the PDF's own weekly-average table date
+# (section s2b — often a Sunday, which a WORKDAY guess can never produce).
+WEEKLY_AVG_BLOCK = ("Thermal Coal Weekly", "AR", "BK", "s2b")
+
+# Coastal Coal Freight extras that don't come from the PDF's data tables:
+# - column W "Composite Index": fetched from the Shanghai Shipping Exchange
+# - the weekly block at cols AA.. : QHD-Guangzhou 60,000-70,000 DWT rate,
+#   parsed from Monday's "Weekly: China's coastal coal freight..." article
+COASTAL_SHEET = "Coastal Coal Freight"
+CBCFI_URL = "https://en.sse.net.cn/currentIndex?indexName=cbcfi"
+WEEKLY_ARTICLE_RE = re.compile(r"Weekly:\s*China'?s\s+coastal\s+coal\s+freight", re.I)
+
+# News-summary sections of Data Dump, refreshed from the issue's article text.
+# n9/n10/n11 are rewritten in place: (title_row, header_row, first, last, n_cols).
+# n8 is a multi-date comparison: a new "M/D Cap | M/D No." column pair is
+# appended per survey date instead (rows fixed by region).
+NEWS_SECTIONS = {
+    "n9": (225, 226, 227, 241, 4),
+    "n10": (243, 244, 245, 248, 5),
+    "n11": (251, 252, 253, 274, 3),
+}
+N8_LAYOUT = (209, 210, 211, 219)  # title_row, header_row, first, last
 
 MONTH_DATE_RE = re.compile(
     r"(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|"
@@ -83,12 +105,32 @@ def log(msg: str) -> None:
     print(msg, flush=True)
 
 
+def load_env_file() -> None:
+    """Load KEY=VALUE pairs from a .env file next to this script (if present)."""
+    p = Path(__file__).with_name(".env")
+    if not p.exists():
+        return
+    for line in p.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        os.environ.setdefault(k.strip(), v.strip().strip("'\""))
+
+
 def col_letter(n: int) -> str:
     s = ""
     while n:
         n, r = divmod(n - 1, 26)
         s = chr(65 + r) + s
     return s
+
+
+def col_num(letters: str) -> int:
+    n = 0
+    for ch in letters:
+        n = n * 26 + ord(ch.upper()) - 64
+    return n
 
 
 # --------------------------------------------------------------------------
@@ -176,6 +218,87 @@ def render_table_pages(pdf_path: Path) -> list[tuple[int, bytes]]:
 
 
 # --------------------------------------------------------------------------
+# 2b. Extra sources: the weekly freight article (text) and the SSE website
+# --------------------------------------------------------------------------
+
+MONTHS = {m: i + 1 for i, m in enumerate(
+    ["january", "february", "march", "april", "may", "june",
+     "july", "august", "september", "october", "november", "december"])}
+
+
+def parse_weekly_freight(pdf_path: Path, report_date: dt.date) -> dict | None:
+    """Parse Monday's "Weekly: China's coastal coal freight..." article (a text
+    page) for the QHD-Guangzhou 60,000-70,000 DWT rate and the week date."""
+    import pdfplumber
+
+    text = None
+    with pdfplumber.open(str(pdf_path)) as pdf:
+        for page in pdf.pages:
+            t = page.extract_text() or ""
+            if WEEKLY_ARTICLE_RE.search(t):
+                text = re.sub(r"\s+", " ", t)
+                break
+    if text is None:
+        return None
+
+    m = re.search(r"60,?000\s*-\s*70,?000\s*DWT.{0,160}?to\s+([\d.]+)\s*yuan/t", text)
+    if not m:
+        log("  WARNING: weekly coastal-freight article found, but the 60,000-70,000 DWT"
+            " rate didn't parse — key column AC manually this week")
+        return None
+    value = float(m.group(1))
+
+    week = None
+    d = re.search(r"yuan/t\s+on\s+([A-Za-z]+)\s+(\d{1,2})", text)
+    if d and d.group(1).lower() in MONTHS:
+        month, day = MONTHS[d.group(1).lower()], int(d.group(2))
+        year = report_date.year - 1 if month - report_date.month > 6 else report_date.year
+        week = dt.date(year, month, day).isoformat()
+    return {"date": week, "qhd_gz_60_70": value}
+
+
+def article_pages_text(pdf_path: Path) -> str:
+    """Concatenated text of the article pages (the pages that are not
+    full-page table images)."""
+    import pdfplumber
+
+    parts = []
+    with pdfplumber.open(str(pdf_path)) as pdf:
+        for i, page in enumerate(pdf.pages):
+            big = [im for im in page.images if im["width"] > 400 and im["height"] > 300]
+            if big:
+                continue
+            t = (page.extract_text() or "").strip()
+            if t:
+                parts.append(f"--- PDF page {i + 1} ---\n{t}")
+    return "\n\n".join(parts)
+
+
+def fetch_cbcfi() -> list[tuple[dt.date, float]]:
+    """Fetch the CBCFI Composite Index (current + previous day) from the SSE."""
+    import urllib.request
+
+    req = urllib.request.Request(
+        CBCFI_URL,
+        headers={"User-Agent": "Mozilla/5.0", "Referer": "https://en.sse.net.cn/indices/cbcfinew.jsp"},
+    )
+    with urllib.request.urlopen(req, timeout=30) as r:
+        payload = json.loads(r.read().decode("utf-8"))
+    d = payload["data"]
+    comp = next(
+        line for line in d["lineDataList"]
+        if line.get("dataItemTypeName") == "CBCFI_T"
+        or line.get("properties", {}).get("lineName_EN") == "COMPOSITE INDEX"
+    )
+    out = []
+    for dkey, vkey in (("lastDate", "lastContent"), ("currentDate", "currentContent")):
+        ds, v = d.get(dkey), comp.get(vkey)
+        if ds and v is not None:
+            out.append((dt.date.fromisoformat(ds), round(float(v), 2)))
+    return out
+
+
+# --------------------------------------------------------------------------
 # 3. Extraction via the Claude API (vision + structured output)
 # --------------------------------------------------------------------------
 
@@ -217,8 +340,41 @@ EXTRACTION_SCHEMA = {
                 "additionalProperties": False,
             },
         },
+        "news": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "date": {"type": "string"},
+                    "period": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                    "rows": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "cells": {
+                                    "type": "array",
+                                    "items": {
+                                        "anyOf": [
+                                            {"type": "string"},
+                                            {"type": "number"},
+                                            {"type": "null"},
+                                        ]
+                                    },
+                                }
+                            },
+                            "required": ["cells"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                "required": ["id", "date", "period", "rows"],
+                "additionalProperties": False,
+            },
+        },
     },
-    "required": ["report_date", "issue", "sections"],
+    "required": ["report_date", "issue", "sections", "news"],
     "additionalProperties": False,
 }
 
@@ -247,13 +403,42 @@ Rules:
 EXTRACTION SPEC:
 """
 
+NEWS_PROMPT = """
 
-def extract_with_claude(images: list[tuple[int, bytes]], spec: list[dict]) -> dict:
-    import anthropic
+ADDITIONALLY: refresh the workbook's news-summary sections from the ARTICLE TEXT
+below, adding a top-level "news" array to the same JSON object. Each entry:
+{"id": "...", "date": "YYYY-MM-DD", "period": "..." or null, "rows": [{"cells": [...]}]}
 
-    client = anthropic.Anthropic()
+Sections (omit an entry entirely if the issue has no matching content):
+- "n8" Shanxi coal-mine suspensions: ONLY if an article reports Shanxi mine
+  suspension/stoppage figures broken down by region (suspended capacity and
+  number of mines). One row per region as printed, cells =
+  [Region/City, County ("" if none), suspended capacity in Mtpa (number),
+  number of mines (number)]. Include a "Total" row if given.
+  "date" = the survey date the figures refer to.
+- "n9" Mongolian & import coking coal update: up to 15 key items about
+  Mongolian / Russian / imported coking coal, port ex-stock prices, coking &
+  thermal mine surveys (utilisation, stocks), mine-mouth price moves. cells =
+  [Item / Location, Value / Status, WoW or DoD Change, Notes]. Include the
+  date of each figure inside the item text like the examples "(Jun 11)".
+- "n10" Indonesia HBA reference prices: ONLY if the issue carries the HBA
+  (ESDM) table. cells = [HBA Grade, CV Basis (Kcal/kg GAR) (number),
+  Price (US$/t) (number), Change (US$/t), Change (%)].
+  "period" = the price period, e.g. "H1 July 2026".
+- "n11" Global market notes: up to 20 items of international / seaborne /
+  macro market news (country imports & exports, futures, tenders, freight,
+  policy, strikes, weather/El Nino, power demand). cells =
+  [Topic, Value / Status, Notes].
 
-    spec_for_model = [
+Keep cells concise (a spreadsheet summary, not prose). Numbers stay numbers.
+"date" defaults to the report date.
+
+ARTICLE TEXT:
+"""
+
+
+def spec_for_model(spec: list[dict]) -> list[dict]:
+    return [
         {
             "id": s["id"],
             "pdf_table_title": s["pdf_table_title"],
@@ -262,6 +447,80 @@ def extract_with_claude(images: list[tuple[int, bytes]], spec: list[dict]) -> di
         }
         for s in spec
     ]
+
+
+def run_extraction(
+    images: list[tuple[int, bytes]], spec: list[dict], engine: str, articles: str = ""
+) -> dict:
+    if engine == "api":
+        return extract_with_api(images, spec, articles)
+    return extract_with_cli(images, spec, articles)
+
+
+def extract_with_cli(images: list[tuple[int, bytes]], spec: list[dict], articles: str = "") -> dict:
+    """Extract via the local `claude` CLI — uses the Claude subscription, no API bill."""
+    import shutil as _shutil
+    import subprocess
+    import tempfile
+
+    claude = _shutil.which("claude")
+    if not claude:
+        sys.exit("ERROR: 'claude' CLI not found on PATH (install Claude Code, or use --engine api)")
+
+    with tempfile.TemporaryDirectory(prefix="cci_") as td:
+        paths = []
+        for page_no, png in images:
+            p = Path(td) / f"page_{page_no:02d}.png"
+            p.write_bytes(png)
+            paths.append(str(p))
+
+        prompt = (
+            "Read ALL of these PNG image files (each is one page of a PDF report):\n"
+            + "\n".join(paths)
+            + "\n\n"
+            + PROMPT
+            + json.dumps(spec_for_model(spec), indent=1)
+            + (NEWS_PROMPT + articles if articles else "")
+            + "\n\nOUTPUT FORMAT: respond with ONLY a single JSON object — no markdown fences,"
+            " no commentary before or after. Shape:\n"
+            '{"report_date": "YYYY-MM-DD", "issue": "NNNN", "sections":'
+            ' [{"id": "...", "date": "YYYY-MM-DD", "rows":'
+            ' [{"label": "...", "values": [number|string|null, ...]}]}],'
+            ' "news": [{"id": "...", "date": "YYYY-MM-DD", "period": "..."|null,'
+            ' "rows": [{"cells": [string|number|null, ...]}]}]}'
+        )
+
+        log("Calling the claude CLI (uses your Claude subscription; may take a few minutes) ...")
+        r = subprocess.run(
+            [claude, "-p", "--output-format", "json", "--allowedTools", "Read"],
+            input=prompt,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=1800,
+            cwd=td,
+        )
+    if r.returncode != 0:
+        sys.exit(f"ERROR: claude CLI failed (exit {r.returncode}):\n{(r.stderr or r.stdout)[:800]}")
+    try:
+        envelope = json.loads(r.stdout)
+        text = envelope.get("result", "") if isinstance(envelope, dict) else r.stdout
+    except json.JSONDecodeError:
+        text = r.stdout
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end <= start:
+        sys.exit(f"ERROR: no JSON found in claude CLI output:\n{text[:800]}")
+    data = json.loads(text[start : end + 1])
+    log("Extraction done (claude CLI).")
+    return data
+
+
+def extract_with_api(images: list[tuple[int, bytes]], spec: list[dict], articles: str = "") -> dict:
+    """Extract via the Anthropic API — requires ANTHROPIC_API_KEY (pay per use)."""
+    import anthropic
+
+    client = anthropic.Anthropic()
 
     content = []
     for page_no, png in images:
@@ -276,7 +535,13 @@ def extract_with_claude(images: list[tuple[int, bytes]], spec: list[dict]) -> di
                 },
             }
         )
-    content.append({"type": "text", "text": PROMPT + json.dumps(spec_for_model, indent=1)})
+    content.append(
+        {
+            "type": "text",
+            "text": PROMPT + json.dumps(spec_for_model(spec), indent=1)
+            + (NEWS_PROMPT + articles if articles else ""),
+        }
+    )
 
     log(f"Calling Claude ({MODEL}) to transcribe the tables ...")
     with client.messages.stream(
@@ -338,16 +603,106 @@ def excel_safe(v):
 
 
 def section_date(data: dict, sid: str) -> dt.date:
+    d = section_date_or_none(data, sid)
+    return d if d else dt.date.fromisoformat(data["report_date"])
+
+
+def section_date_or_none(data: dict, sid: str) -> dt.date | None:
     for s in data["sections"]:
         if s["id"] == sid:
             try:
                 return dt.date.fromisoformat(s["date"])
-            except (ValueError, KeyError):
+            except (ValueError, KeyError, TypeError):
                 break
-    return dt.date.fromisoformat(data["report_date"])
+    return None
 
 
-def write_workbook(xlsx: Path, spec: list[dict], data: dict, force: bool, backup: bool) -> None:
+def retitle(dump, row: int, d: dt.date) -> None:
+    cell = dump.range((row, 1))
+    title = cell.value
+    if isinstance(title, str) and MONTH_DATE_RE.search(title):
+        cell.value = MONTH_DATE_RE.sub(f"{d:%B} {d.day}, {d.year}", title, count=1)
+
+
+def write_news_sections(dump, news: list[dict], report_date: dt.date) -> None:
+    """Refresh the news-summary sections (8-11) of Data Dump from the issue's
+    articles: n9/n10/n11 are rewritten in place, n8 gains a date column pair."""
+    for sec in news:
+        sid = sec.get("id")
+        rows = sec.get("rows") or []
+        try:
+            d = dt.date.fromisoformat(sec.get("date") or "")
+        except ValueError:
+            d = report_date
+
+        if sid == "n8" and rows:
+            t_row, h_row, first, last = N8_LAYOUT
+            headers = dump.range((h_row, 1), (h_row, 60)).value
+            tag = f"{d.month}/{d.day}"
+            if any(isinstance(h, str) and h.startswith(tag + " ") for h in headers):
+                log(f"  Data Dump n8: {tag} columns already present")
+                continue
+            edge = max(i for i, h in enumerate(headers) if h is not None) + 1
+            dump.range((h_row, edge + 1)).value = f"{tag} Cap"
+            dump.range((h_row, edge + 2)).value = f"{tag} No."
+            by_ab, by_a = {}, {}
+            for r in range(first, last + 1):
+                a = norm_label(str(dump.range((r, 1)).value or ""))
+                b = norm_label(str(dump.range((r, 2)).value or ""))
+                by_ab[f"{a}|{b}"] = r
+                by_a.setdefault(a, []).append(r)
+
+            def n8_row(region, county) -> int | None:
+                mr = norm_label(str(region))
+                mc = norm_label(str(county or ""))
+                if f"{mr}|{mc}" in by_ab:
+                    return by_ab[f"{mr}|{mc}"]
+                base = mr.split(" (")[0]  # "total (changzhi, ...)" -> "total"
+                if not mc:
+                    # a city given without county means its (total) row if one exists
+                    for key in (f"{base} (total)", base):
+                        if len(by_a.get(key, [])) == 1:
+                            return by_a[key][0]
+                return None
+
+            n = 0
+            for row in rows:
+                c = (row.get("cells") or []) + [None] * 4
+                r = n8_row(c[0], c[1])
+                if r is None:
+                    log(f"  WARNING: n8 region {c[0]!r}/{c[1]!r} has no Data Dump row; skipped")
+                    continue
+                dump.range((r, edge + 1)).value = excel_safe(c[2])
+                dump.range((r, edge + 2)).value = excel_safe(c[3])
+                n += 1
+            retitle(dump, t_row, d)
+            log(f"  Data Dump n8: added {tag} columns ({n} regions)")
+
+        elif sid in NEWS_SECTIONS and rows:
+            t_row, h_row, first, last, ncols = NEWS_SECTIONS[sid]
+            capacity = last - first + 1
+            if len(rows) > capacity:
+                log(f"  WARNING: {sid}: {len(rows)} items, keeping first {capacity}")
+                rows = rows[:capacity]
+            grid = []
+            for row in rows:
+                c = list(row.get("cells") or [])[:ncols]
+                c += [None] * (ncols - len(c))
+                grid.append([excel_safe(v) for v in c])
+            grid += [[None] * ncols for _ in range(capacity - len(grid))]
+            dump.range((first, 1), (last, ncols)).value = grid
+            if sid == "n10" and sec.get("period"):
+                cell = dump.range((t_row, 1))
+                if isinstance(cell.value, str):
+                    cell.value = re.sub(r"H[12]\s+\w+\s+\d{4}", sec["period"], cell.value, count=1)
+            else:
+                retitle(dump, t_row, d)
+            log(f"  Data Dump {sid}: wrote {len(rows)} news rows")
+
+
+def write_workbook(
+    xlsx: Path, spec: list[dict], data: dict, force: bool, backup: bool, web: bool = True
+) -> None:
     import xlwings as xw
 
     report_date = dt.date.fromisoformat(data["report_date"])
@@ -394,6 +749,10 @@ def write_workbook(xlsx: Path, spec: list[dict], data: dict, force: bool, backup
                 tcell.value = MONTH_DATE_RE.sub(sec_date.strftime("%B %d, %Y"), title, count=1)
             log(f"  Data Dump {s['id']}: wrote {n_written} rows")
 
+        # --- 4a-bis. News-summary sections from the issue's articles ---------------
+        if data.get("news"):
+            write_news_sections(dump, data["news"], report_date)
+
         # header cell A1: issue + date
         a1 = dump.range("A1")
         if isinstance(a1.value, str):
@@ -413,6 +772,28 @@ def write_workbook(xlsx: Path, spec: list[dict], data: dict, force: bool, backup
                 continue
             append_series_row(sht, target, force)
 
+        # --- 4c. Weekly Average block (AR:BK) dated from the PDF's s2b table ------
+        d2b = section_date_or_none(data, "s2b")
+        if d2b:
+            extend_weekly_avg_block(wb.sheets[WEEKLY_AVG_BLOCK[0]], d2b)
+
+        # --- 4d. Lag-dated port rows (Guangzhou) -> their own date row ------------
+        fix_dated_port_values(wb, section_date(data, "s7"))
+
+        # --- 4e. Coastal Coal Freight: weekly article value + SSE Composite Index -
+        cw = data.get("coastal_weekly")
+        if cw and cw.get("qhd_gz_60_70") is not None:
+            append_coastal_weekly_row(wb.sheets[COASTAL_SHEET], cw)
+        if web:
+            try:
+                pairs = fetch_cbcfi()
+            except Exception as e:
+                pairs = []
+                log(f"  WARNING: SSE Composite Index fetch failed ({e}); key column W manually")
+            if pairs:
+                fill_composite_index(wb.sheets[COASTAL_SHEET], pairs)
+
+        app.api.CalculateFull()
         wb.save()
         wb.close()
         log(f"Saved: {xlsx}")
@@ -420,22 +801,28 @@ def write_workbook(xlsx: Path, spec: list[dict], data: dict, force: bool, backup
         app.quit()
 
 
+def find_formula_row(sht, col: int = 1) -> int | None:
+    """Row of the bottom formula cell in the given column (the live template row)."""
+    max_row = sht.used_range.last_cell.row
+    formulas = sht.range((1, col), (max_row, col)).formula
+    if isinstance(formulas, str):
+        formulas = [[formulas]]
+    for i in range(len(formulas) - 1, -1, -1):
+        v = formulas[i][0] if isinstance(formulas[i], (list, tuple)) else formulas[i]
+        if isinstance(v, str) and v.startswith("="):
+            return i + 1
+    return None
+
+
 def append_series_row(sht, target_date: dt.date, force: bool) -> None:
     name = sht.name
-    used = sht.used_range
-    max_row = used.last_cell.row
-    max_col = used.last_cell.column
+    max_col = sht.used_range.last_cell.column
+    if name == WEEKLY_AVG_BLOCK[0]:
+        # the AR:BK weekly-average block is managed by extend_weekly_avg_block
+        # (dated from s2b); the daily append must not touch it
+        max_col = min(max_col, col_num(WEEKLY_AVG_BLOCK[1]) - 1)
 
-    # locate the bottom formula row via column A
-    col_a = sht.range((1, 1), (max_row, 1)).formula
-    if isinstance(col_a, str):
-        col_a = [[col_a]]
-    f_row = None
-    for i in range(len(col_a) - 1, -1, -1):
-        v = col_a[i][0] if isinstance(col_a[i], (list, tuple)) else col_a[i]
-        if isinstance(v, str) and v.startswith("="):
-            f_row = i + 1
-            break
+    f_row = find_formula_row(sht)
     if f_row is None or f_row < 2:
         log(f"  SKIP {name}: no formula row found")
         return
@@ -473,12 +860,196 @@ def append_series_row(sht, target_date: dt.date, force: bool) -> None:
         # all other formulas (diffs, SUMs, AVERAGEIFS) stay live: they only
         # reference in-sheet cells and remain stable once those are literals
 
-    # sheets with a self-computing block that lags one row behind value rows
-    if name in LAGGING_BLOCKS:
-        c1, c2 = LAGGING_BLOCKS[name]
-        sht.range(f"{c1}{f_row - 1}:{c2}{f_row}").api.FillDown()
-
     log(f"  {name}: appended {target_date} (row {f_row}, froze {n_frozen} cells)")
+
+
+def extend_weekly_avg_block(sht, s2b_date: dt.date) -> None:
+    """Extend the Weekly Average block (AR:BK) by one row, dated from the PDF's
+    own weekly-average table (s2b). Runs on any issue that carries a new s2b
+    date (normally Mondays), independent of the Friday weekly-index append."""
+    _, c1, c2, _ = WEEKLY_AVG_BLOCK
+    c1i = col_num(c1)
+
+    max_row = sht.used_range.last_cell.row
+    bottom = None
+    for r in range(max_row, 0, -1):
+        cell = sht.range((r, c1i))
+        if cell.formula or cell.value is not None:
+            bottom = r
+            break
+    if bottom is None:
+        log(f"  SKIP {sht.name} weekly-average block: no rows found in {c1}")
+        return
+
+    f = sht.range((bottom, c1i)).formula
+    if isinstance(f, str) and f.startswith("="):
+        # legacy state: bottom date is a live WORKDAY guess; the frozen date above gates
+        prev = sht.range((bottom - 1, c1i)).value
+        prev_date = prev.date() if isinstance(prev, dt.datetime) else prev
+        if isinstance(prev_date, dt.date) and s2b_date <= prev_date:
+            return
+        sht.range(f"{c1}{bottom}:{c2}{bottom + 1}").api.FillDown()
+        sht.range((bottom, c1i)).value = s2b_date
+        new_row = bottom
+    else:
+        v = sht.range((bottom, c1i)).value
+        cur = v.date() if isinstance(v, dt.datetime) else v
+        if isinstance(cur, dt.date) and s2b_date <= cur:
+            return
+        sht.range(f"{c1}{bottom}:{c2}{bottom + 1}").api.FillDown()
+        sht.range((bottom + 1, c1i)).value = s2b_date
+        new_row = bottom + 1
+    log(f"  {sht.name}: weekly-average block dated {s2b_date} (row {new_row}, from s2b)")
+
+
+def fix_dated_port_values(wb, target_date: dt.date) -> None:
+    """Ports whose table row carries its own (older) date — e.g. Guangzhou,
+    published with a lag — get their value moved from the report-date row of
+    Port Stockpile to the row matching the date printed in the PDF."""
+    first, last = next((s[4], s[5]) for s in SECTIONS if s[0] == "s7")
+    dump = wb.sheets["Data Dump"]
+    sht = wb.sheets["Port Stockpile"]
+
+    f_row = find_formula_row(sht)
+    if f_row is None:
+        return
+    max_col = sht.used_range.last_cell.column
+    formulas = sht.range((f_row, 1), (f_row, max_col)).formula
+    if isinstance(formulas, str):
+        formulas = ((formulas,),)
+    formulas = formulas[0] if isinstance(formulas[0], (list, tuple)) else formulas
+
+    dates = sht.range((1, 1), (f_row - 1, 1)).value  # column A, for date lookups
+    def sheet_row(d: dt.date) -> int | None:
+        for i in range(len(dates) - 1, max(-1, len(dates) - 60), -1):
+            v = dates[i]
+            if isinstance(v, dt.datetime) and v.date() == d:
+                return i + 1
+        return None
+
+    for idx, f in enumerate(formulas):
+        if not isinstance(f, str):
+            continue
+        m = re.search(r"'Data Dump'!\$D\$(\d+)", f)
+        if not m or not (first <= int(m.group(1)) <= last):
+            continue
+        drow = int(m.group(1))
+        own = dump.range((drow, 3)).value  # the row's own Date cell
+        if isinstance(own, dt.datetime):
+            own_date = own.date()
+        elif isinstance(own, str) and re.match(r"^\d{4}/\d{1,2}/\d{1,2}$", own.strip()):
+            y, mo, dy = map(int, own.strip().split("/"))
+            own_date = dt.date(y, mo, dy)
+        else:
+            continue
+        if own_date == target_date:
+            continue
+        val = dump.range((drow, 4)).value
+        if val is None:
+            continue
+        r_own = sheet_row(own_date)
+        if r_own is None:
+            log(f"  WARNING: Port Stockpile has no {own_date} row for the lag-dated"
+                f" value in Data Dump row {drow}; leaving it on the {target_date} row")
+            continue
+        col = idx + 1
+        sht.range((r_own, col)).value = excel_safe(val)
+        r_tgt = sheet_row(target_date)
+        if r_tgt is not None and r_tgt != r_own:
+            tgt = sht.range((r_tgt, col))
+            if tgt.value == val:
+                tgt.clear_contents()
+        log(f"  Port Stockpile: {col_letter(col)} value {val} placed at its own date"
+            f" {own_date} (row {r_own})")
+
+
+def append_coastal_weekly_row(sht, cw: dict) -> None:
+    """Extend the weekly article block (cols AA..) on Coastal Coal Freight with
+    this week's QHD-Guangzhou 60,000-70,000 DWT rate from Monday's article."""
+    a = col_num("AA")
+
+    # right edge of the block = last contiguous named header in row 4
+    edge = a
+    while sht.range((4, edge + 1)).value is not None:
+        edge += 1
+
+    max_row = sht.used_range.last_cell.row
+    bottom = None
+    for r in range(max_row, 4, -1):
+        cell = sht.range((r, a))
+        if cell.formula or cell.value is not None:
+            bottom = r
+            break
+    if bottom is None:
+        log("  SKIP coastal weekly block: no rows found in AA")
+        return
+
+    prev = sht.range((bottom, a)).value
+    prev_date = prev.date() if isinstance(prev, dt.datetime) else None
+    week = dt.date.fromisoformat(cw["date"]) if cw.get("date") else None
+    if week is None and prev_date is not None:
+        week = prev_date + dt.timedelta(days=7)
+    if week is None or (prev_date is not None and prev_date >= week):
+        log(f"  SKIP coastal weekly block: last row {prev_date} already covers {week}")
+        return
+
+    # the manual value column: header names the 60,000-70,000 DWT route and the
+    # bottom cell is not a formula (its twin column computes from an external file)
+    vcol = None
+    for c in range(a, edge + 1):
+        h = sht.range((4, c)).value
+        f = sht.range((bottom, c)).formula
+        if isinstance(h, str) and "60,000-70,000" in h and "GZ" in h.upper() \
+                and not (isinstance(f, str) and f.startswith("=")):
+            vcol = c
+            break
+    if vcol is None:
+        log("  WARNING: coastal weekly block: QHD-GZ 60,000-70,000 DWT manual column"
+            " not found; key it by hand")
+        return
+
+    sht.range(f"{col_letter(a)}{bottom}:{col_letter(edge)}{bottom + 1}").api.FillDown()
+    new = bottom + 1
+    got = sht.range((new, a)).value
+    if not (isinstance(got, dt.datetime) and got.date() == week):
+        sht.range((new, a)).value = week  # date drifted off the +7 pattern (holiday)
+    sht.range((new, vcol)).value = cw["qhd_gz_60_70"]
+    log(f"  {sht.name}: weekly article row {new} = {week}, "
+        f"{col_letter(vcol)} = {cw['qhd_gz_60_70']} yuan/t")
+
+
+def fill_composite_index(sht, pairs: list[tuple[dt.date, float]]) -> None:
+    """Write the SSE CBCFI Composite Index into the matching date rows."""
+    max_col = sht.used_range.last_cell.column
+    headers = sht.range((4, 1), (4, max_col)).value
+    if not isinstance(headers, (list, tuple)):
+        headers = [headers]
+    col = next(
+        (i + 1 for i, h in enumerate(headers)
+         if isinstance(h, str) and h.strip().lower() == "composite index"),
+        None,
+    )
+    if col is None:
+        log("  WARNING: 'Composite Index' header not found on Coastal Coal Freight")
+        return
+
+    # only fill literal dated rows: writing into the live formula row would get
+    # copied down by the next day's FillDown and go stale
+    f_row = find_formula_row(sht)
+    max_row = (f_row - 1) if f_row else sht.used_range.last_cell.row
+    dates = sht.range((1, 1), (max_row, 1)).value
+    for d, v in pairs:
+        row = None
+        for i in range(len(dates) - 1, max(-1, len(dates) - 60), -1):
+            if isinstance(dates[i], dt.datetime) and dates[i].date() == d:
+                row = i + 1
+                break
+        if row is None:
+            continue  # index published for a date the sheet doesn't track yet
+        cell = sht.range((row, col))
+        if cell.value is None:
+            cell.value = v
+            log(f"  {sht.name}: Composite Index {v} at {d} (row {row}, from SSE)")
 
 
 # --------------------------------------------------------------------------
@@ -492,8 +1063,17 @@ def main() -> None:
     ap.add_argument("--from-json", help="skip the PDF/API and load extraction from this JSON file")
     ap.add_argument("--force", action="store_true", help="append rows even if the date already exists")
     ap.add_argument("--no-backup", action="store_true", help="don't copy the workbook to backups\\ first")
+    ap.add_argument("--no-web", action="store_true",
+                    help="skip fetching the SSE Composite Index (column W stays manual)")
+    ap.add_argument(
+        "--engine",
+        choices=["cli", "api"],
+        default="cli",
+        help="extraction engine: 'cli' = local claude CLI / subscription (default), 'api' = Anthropic API key",
+    )
     args = ap.parse_args()
 
+    load_env_file()
     xlsx = Path(args.xlsx)
     if not xlsx.exists():
         sys.exit(f"ERROR: workbook not found: {xlsx}")
@@ -510,7 +1090,13 @@ def main() -> None:
         if not pdf.exists():
             sys.exit(f"ERROR: PDF not found: {pdf}")
         images = render_table_pages(pdf)
-        data = extract_with_claude(images, spec)
+        articles = article_pages_text(pdf)
+        data = run_extraction(images, spec, args.engine, articles)
+        cw = parse_weekly_freight(pdf, dt.date.fromisoformat(data["report_date"]))
+        if cw:
+            data["coastal_weekly"] = cw
+            log(f"Weekly freight article: QHD-GZ 60-70k DWT = {cw['qhd_gz_60_70']}"
+                f" yuan/t (week of {cw['date']})")
 
     validate(data, spec)
     log(f"Report date: {data['report_date']}  (Issue {data.get('issue')})")
@@ -523,7 +1109,8 @@ def main() -> None:
         log("Dry run: workbook not modified.")
         return
 
-    write_workbook(xlsx, spec, data, force=args.force, backup=not args.no_backup)
+    write_workbook(xlsx, spec, data, force=args.force, backup=not args.no_backup,
+                   web=not args.no_web)
 
 
 if __name__ == "__main__":

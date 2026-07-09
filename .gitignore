@@ -1,2 +1,14 @@
-.claude/
+# Secrets — never commit (holds ANTHROPIC_API_KEY)
+.env
+
+# Local environment / caches
+.venv/
 __pycache__/
+.claude/
+
+# Sxcoal subscriber content & personal data — keep out of the repo
+*.pdf
+*.xlsx
+*.xlsm
+backups/
+check*.json
