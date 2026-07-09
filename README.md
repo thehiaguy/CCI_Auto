@@ -34,9 +34,24 @@ python -m pip install -r requirements.txt
    prompt. (Skip this only if you plan to use the paid API engine instead —
    see [Extraction engines](#extraction-engines).)
 
-**5. Put the workbook in place** — the script expects
-   `C:\Users\<you>\Downloads\SXcoal data.xlsx` by default. If yours lives
-   elsewhere, pass `--xlsx "D:\path\to\SXcoal data.xlsx"` on every run.
+**5. Put the workbook in place.** By default the script looks for the Excel
+   file in **your Downloads folder**, named exactly **`SXcoal data.xlsx`**:
+
+   ```
+   C:\Users\<your username>\Downloads\SXcoal data.xlsx
+   ```
+
+   (It uses whoever-is-logged-in's Downloads folder automatically — no need
+   to edit any path in the script.) The name must match exactly, including
+   the space: `SXcoal data.xlsx`.
+
+   Keeping it somewhere else instead? You have two options:
+
+   - pass the path on each run: `--xlsx "D:\path\to\SXcoal data.xlsx"`, or
+   - change the default permanently: edit the `DEFAULT_XLSX` line near the
+     top of `cci_daily.py`.
+
+   The `backups\` folder is created next to the workbook automatically.
 
 That's it. No API key, no config files needed for the default setup.
 

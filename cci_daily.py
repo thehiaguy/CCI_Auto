@@ -36,7 +36,9 @@ import shutil
 import sys
 from pathlib import Path
 
-DEFAULT_XLSX = r"C:\Users\res1\Downloads\SXcoal data.xlsx"
+# Default workbook location: the current user's Downloads folder.
+# Keep the file named exactly "SXcoal data.xlsx", or pass --xlsx with its path.
+DEFAULT_XLSX = str(Path.home() / "Downloads" / "SXcoal data.xlsx")
 MODEL = "claude-opus-4-8"
 RENDER_SCALE = 2.2  # ~158 dpi; keeps pages under Claude's 2576px high-res limit
 

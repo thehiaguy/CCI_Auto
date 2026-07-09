@@ -113,7 +113,7 @@ def main() -> None:
     check_json = HERE / "check.json"
     if args.live or not check_json.exists():
         pdfs = sorted(HERE.glob("CCI Daily*.pdf")) + sorted(
-            Path(r"C:\Users\res1\Downloads").glob("CCI Daily*.pdf")
+            (Path.home() / "Downloads").glob("CCI Daily*.pdf")
         )
         if not pdfs:
             sys.exit("ERROR: no 'CCI Daily*.pdf' found for live extraction")
