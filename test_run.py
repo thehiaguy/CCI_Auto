@@ -132,9 +132,6 @@ def main() -> None:
     data, old_date, sim_date = shift_dates(data, workbook_newest_date(src))
     log(f"Simulating a new issue: {old_date} -> {sim_date}\n")
 
-    # synthetic weekly-article value to exercise the Coastal Coal Freight AA block
-    data["coastal_weekly"] = {"date": sim_date.isoformat(), "qhd_gz_60_70": 33.3}
-
     test_file = HERE / "test_run.xlsx"
     shutil.copy2(src, test_file)
     write_workbook(test_file, spec, data, force=False, backup=False, web=False)
@@ -240,19 +237,6 @@ def main() -> None:
 
     title = wb_v["Data Dump"].cell(row=3, column=1).value or ""
     check(sim_date.strftime("%B %d, %Y") in str(title), f"Data Dump titles re-dated ({title!r})")
-
-    # coastal weekly-article block: new row dated sim_date with the synthetic value
-    ws_v = wb_v["Coastal Coal Freight"]
-    aa_bottom = next(
-        (r for r in range(ws_v.max_row, 4, -1) if ws_v.cell(row=r, column=27).value is not None),
-        None,
-    )
-    aa_date = ws_v.cell(row=aa_bottom, column=27).value if aa_bottom else None
-    ac_val = ws_v.cell(row=aa_bottom, column=29).value if aa_bottom else None
-    check(
-        isinstance(aa_date, dt.datetime) and aa_date.date() == sim_date and ac_val == 33.3,
-        f"Coastal weekly block: row {aa_bottom} dated {aa_date} with AC={ac_val}",
-    )
 
     wb_f.close()
     wb_v.close()

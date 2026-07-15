@@ -6,9 +6,20 @@
 __pycache__/
 .claude/
 
+# Machine-specific notes (contains internal file paths)
+CLAUDE.md
+
 # Sxcoal subscriber content & personal data — keep out of the repo
 *.pdf
 *.xlsx
 *.xlsm
 backups/
 check*.json
+
+# Scheduled-run output
+logs/
+
+# Vestigial scheduled-task runners (the task was removed 2026-07-14 — the
+# unattended run crashed Excel's COM layer when Excel was already open).
+run_hidden.vbs
+run_scheduled.bat

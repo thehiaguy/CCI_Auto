@@ -76,13 +76,13 @@ SERIES_SHEETS = [
 # (section s2b — often a Sunday, which a WORKDAY guess can never produce).
 WEEKLY_AVG_BLOCK = ("Thermal Coal Weekly", "AR", "BK", "s2b")
 
-# Coastal Coal Freight extras that don't come from the PDF's data tables:
+# Coastal Coal Freight extra that doesn't come from the PDF's data tables:
 # - column W "Composite Index": fetched from the Shanghai Shipping Exchange
-# - the weekly block at cols AA.. : QHD-Guangzhou 60,000-70,000 DWT rate,
-#   parsed from Monday's "Weekly: China's coastal coal freight..." article
+# The weekly block at cols AA.. (QHD-Guangzhou 60,000-70,000 DWT rate from the
+# Monday freight article) is maintained MANUALLY — the code that used to
+# auto-fill column AC was removed 2026-07-14 by choice, not by accident.
 COASTAL_SHEET = "Coastal Coal Freight"
 CBCFI_URL = "https://en.sse.net.cn/currentIndex?indexName=cbcfi"
-WEEKLY_ARTICLE_RE = re.compile(r"Weekly:\s*China'?s\s+coastal\s+coal\s+freight", re.I)
 
 # News-summary sections of Data Dump, refreshed from the issue's article text.
 # n9/n10/n11 are rewritten in place: (title_row, header_row, first, last, n_cols).
@@ -220,43 +220,9 @@ def render_table_pages(pdf_path: Path) -> list[tuple[int, bytes]]:
 
 
 # --------------------------------------------------------------------------
-# 2b. Extra sources: the weekly freight article (text) and the SSE website
+# 2b. Extra source: the SSE website (Composite Index). The weekly coastal
+# freight article is NOT parsed — column AC is keyed by hand (see COASTAL_SHEET).
 # --------------------------------------------------------------------------
-
-MONTHS = {m: i + 1 for i, m in enumerate(
-    ["january", "february", "march", "april", "may", "june",
-     "july", "august", "september", "october", "november", "december"])}
-
-
-def parse_weekly_freight(pdf_path: Path, report_date: dt.date) -> dict | None:
-    """Parse Monday's "Weekly: China's coastal coal freight..." article (a text
-    page) for the QHD-Guangzhou 60,000-70,000 DWT rate and the week date."""
-    import pdfplumber
-
-    text = None
-    with pdfplumber.open(str(pdf_path)) as pdf:
-        for page in pdf.pages:
-            t = page.extract_text() or ""
-            if WEEKLY_ARTICLE_RE.search(t):
-                text = re.sub(r"\s+", " ", t)
-                break
-    if text is None:
-        return None
-
-    m = re.search(r"60,?000\s*-\s*70,?000\s*DWT.{0,160}?to\s+([\d.]+)\s*yuan/t", text)
-    if not m:
-        log("  WARNING: weekly coastal-freight article found, but the 60,000-70,000 DWT"
-            " rate didn't parse — key column AC manually this week")
-        return None
-    value = float(m.group(1))
-
-    week = None
-    d = re.search(r"yuan/t\s+on\s+([A-Za-z]+)\s+(\d{1,2})", text)
-    if d and d.group(1).lower() in MONTHS:
-        month, day = MONTHS[d.group(1).lower()], int(d.group(2))
-        year = report_date.year - 1 if month - report_date.month > 6 else report_date.year
-        week = dt.date(year, month, day).isoformat()
-    return {"date": week, "qhd_gz_60_70": value}
 
 
 def article_pages_text(pdf_path: Path) -> str:
@@ -726,10 +692,12 @@ def write_workbook(
 
         # --- 4a. Data Dump values -------------------------------------------------
         sections_by_id = {s["id"]: s for s in data["sections"]}
+        empty_sections = []  # sections that got no data (truncated-PDF check below)
         for s in spec:
             got = sections_by_id.get(s["id"])
             if not got:
                 log(f"  SKIP section {s['id']}: not in extraction")
+                empty_sections.append(s["id"])
                 continue
             rows_by_label = {norm_label(r["label"]): r["values"] for r in got["rows"]}
             n_written = 0
@@ -750,6 +718,21 @@ def write_workbook(
             if isinstance(title, str) and MONTH_DATE_RE.search(title):
                 tcell.value = MONTH_DATE_RE.sub(sec_date.strftime("%B %d, %Y"), title, count=1)
             log(f"  Data Dump {s['id']}: wrote {n_written} rows")
+            if n_written == 0:
+                empty_sections.append(s["id"])
+
+        # Truncated-PDF guard: in a healthy issue every Data Dump section gets data.
+        # A *cluster* of empty sections is the tell-tale sign of a missing PDF page
+        # (a single empty section can be a legitimately-absent table, so don't alarm
+        # on one). This does not abort — the data that did land is still valid — it
+        # just flags the run loudly so a corrected PDF can be re-run.
+        if len(empty_sections) >= 2:
+            log("  " + "!" * 60)
+            log(f"  WARNING: {len(empty_sections)} Data Dump sections got NO data: "
+                f"{', '.join(empty_sections)}")
+            log("  This often means the PDF is missing a page. Check the source PDF;"
+                " if a corrected copy is available, restore the pre-run backup and re-run.")
+            log("  " + "!" * 60)
 
         # --- 4a-bis. News-summary sections from the issue's articles ---------------
         if data.get("news"):
@@ -782,10 +765,9 @@ def write_workbook(
         # --- 4d. Lag-dated port rows (Guangzhou) -> their own date row ------------
         fix_dated_port_values(wb, section_date(data, "s7"))
 
-        # --- 4e. Coastal Coal Freight: weekly article value + SSE Composite Index -
-        cw = data.get("coastal_weekly")
-        if cw and cw.get("qhd_gz_60_70") is not None:
-            append_coastal_weekly_row(wb.sheets[COASTAL_SHEET], cw)
+        # --- 4e. Coastal Coal Freight: SSE Composite Index (column W) --------------
+        # NB: the weekly AA.. block (incl. column AC, the 60,000-70,000 DWT rate from
+        # the Monday freight article) is filled in by hand — no code writes it.
         if web:
             try:
                 pairs = fetch_cbcfi()
@@ -965,61 +947,6 @@ def fix_dated_port_values(wb, target_date: dt.date) -> None:
             f" {own_date} (row {r_own})")
 
 
-def append_coastal_weekly_row(sht, cw: dict) -> None:
-    """Extend the weekly article block (cols AA..) on Coastal Coal Freight with
-    this week's QHD-Guangzhou 60,000-70,000 DWT rate from Monday's article."""
-    a = col_num("AA")
-
-    # right edge of the block = last contiguous named header in row 4
-    edge = a
-    while sht.range((4, edge + 1)).value is not None:
-        edge += 1
-
-    max_row = sht.used_range.last_cell.row
-    bottom = None
-    for r in range(max_row, 4, -1):
-        cell = sht.range((r, a))
-        if cell.formula or cell.value is not None:
-            bottom = r
-            break
-    if bottom is None:
-        log("  SKIP coastal weekly block: no rows found in AA")
-        return
-
-    prev = sht.range((bottom, a)).value
-    prev_date = prev.date() if isinstance(prev, dt.datetime) else None
-    week = dt.date.fromisoformat(cw["date"]) if cw.get("date") else None
-    if week is None and prev_date is not None:
-        week = prev_date + dt.timedelta(days=7)
-    if week is None or (prev_date is not None and prev_date >= week):
-        log(f"  SKIP coastal weekly block: last row {prev_date} already covers {week}")
-        return
-
-    # the manual value column: header names the 60,000-70,000 DWT route and the
-    # bottom cell is not a formula (its twin column computes from an external file)
-    vcol = None
-    for c in range(a, edge + 1):
-        h = sht.range((4, c)).value
-        f = sht.range((bottom, c)).formula
-        if isinstance(h, str) and "60,000-70,000" in h and "GZ" in h.upper() \
-                and not (isinstance(f, str) and f.startswith("=")):
-            vcol = c
-            break
-    if vcol is None:
-        log("  WARNING: coastal weekly block: QHD-GZ 60,000-70,000 DWT manual column"
-            " not found; key it by hand")
-        return
-
-    sht.range(f"{col_letter(a)}{bottom}:{col_letter(edge)}{bottom + 1}").api.FillDown()
-    new = bottom + 1
-    got = sht.range((new, a)).value
-    if not (isinstance(got, dt.datetime) and got.date() == week):
-        sht.range((new, a)).value = week  # date drifted off the +7 pattern (holiday)
-    sht.range((new, vcol)).value = cw["qhd_gz_60_70"]
-    log(f"  {sht.name}: weekly article row {new} = {week}, "
-        f"{col_letter(vcol)} = {cw['qhd_gz_60_70']} yuan/t")
-
-
 def fill_composite_index(sht, pairs: list[tuple[dt.date, float]]) -> None:
     """Write the SSE CBCFI Composite Index into the matching date rows."""
     max_col = sht.used_range.last_cell.column
@@ -1094,11 +1021,6 @@ def main() -> None:
         images = render_table_pages(pdf)
         articles = article_pages_text(pdf)
         data = run_extraction(images, spec, args.engine, articles)
-        cw = parse_weekly_freight(pdf, dt.date.fromisoformat(data["report_date"]))
-        if cw:
-            data["coastal_weekly"] = cw
-            log(f"Weekly freight article: QHD-GZ 60-70k DWT = {cw['qhd_gz_60_70']}"
-                f" yuan/t (week of {cw['date']})")
 
     validate(data, spec)
     log(f"Report date: {data['report_date']}  (Issue {data.get('issue')})")
