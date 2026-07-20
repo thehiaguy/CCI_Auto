@@ -40,6 +40,12 @@ load_env_file()
 XLSX = Path(os.environ.get("CCI_XLSX") or Path.home() / "Downloads" / "SXcoal data.xlsx")
 ARCHIVE = Path(os.environ.get("CCI_ARCHIVE") or Path.home() / "Downloads")
 
+# Model for the extraction step. Sonnet transcribes these tables identically to
+# Opus (verified cell-by-cell on the Jul 16 2026 issue: 1095 cells, 0 differences)
+# for a fraction of the subscription quota. Without this the claude CLI would
+# inherit whatever model is set in the user's global settings.
+MODEL = "sonnet"
+
 MONTHS = {
     m: i
     for i, m in enumerate(
@@ -103,7 +109,7 @@ def main() -> int:
         json_out = str(HERE / f"check_{d.strftime('%b%d').lower()}.json")
         result = subprocess.run(
             [sys.executable, script, "--pdf", str(pdf),
-             "--xlsx", str(XLSX), "--json", json_out]
+             "--xlsx", str(XLSX), "--json", json_out, "--model", MODEL]
         )
         if result.returncode != 0:
             print(f"\nERROR while processing {d}. Stopping here.")

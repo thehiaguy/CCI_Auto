@@ -418,14 +418,16 @@ def spec_for_model(spec: list[dict]) -> list[dict]:
 
 
 def run_extraction(
-    images: list[tuple[int, bytes]], spec: list[dict], engine: str, articles: str = ""
+    images: list[tuple[int, bytes]], spec: list[dict], engine: str, articles: str = "",
+    model: str = "",
 ) -> dict:
     if engine == "api":
         return extract_with_api(images, spec, articles)
-    return extract_with_cli(images, spec, articles)
+    return extract_with_cli(images, spec, articles, model)
 
 
-def extract_with_cli(images: list[tuple[int, bytes]], spec: list[dict], articles: str = "") -> dict:
+def extract_with_cli(images: list[tuple[int, bytes]], spec: list[dict], articles: str = "",
+                     model: str = "") -> dict:
     """Extract via the local `claude` CLI — uses the Claude subscription, no API bill."""
     import shutil as _shutil
     import subprocess
@@ -458,9 +460,13 @@ def extract_with_cli(images: list[tuple[int, bytes]], spec: list[dict], articles
             ' "rows": [{"cells": [string|number|null, ...]}]}]}'
         )
 
-        log("Calling the claude CLI (uses your Claude subscription; may take a few minutes) ...")
+        cmd = [claude, "-p", "--output-format", "json", "--allowedTools", "Read"]
+        if model:
+            cmd += ["--model", model]
+        log(f"Calling the claude CLI (model: {model or 'default from settings'};"
+            " uses your Claude subscription; may take a few minutes) ...")
         r = subprocess.run(
-            [claude, "-p", "--output-format", "json", "--allowedTools", "Read"],
+            cmd,
             input=prompt,
             capture_output=True,
             text=True,
@@ -474,6 +480,14 @@ def extract_with_cli(images: list[tuple[int, bytes]], spec: list[dict], articles
     try:
         envelope = json.loads(r.stdout)
         text = envelope.get("result", "") if isinstance(envelope, dict) else r.stdout
+        if isinstance(envelope, dict):
+            # Report which model actually served the request, so a mistyped or
+            # ignored --model doesn't silently fall back to the settings default.
+            served = envelope.get("modelUsage") or envelope.get("model")
+            if isinstance(served, dict):
+                served = ", ".join(served)
+            if served:
+                log(f"Served by: {served}")
     except json.JSONDecodeError:
         text = r.stdout
     start, end = text.find("{"), text.rfind("}")
@@ -1000,6 +1014,8 @@ def main() -> None:
         default="cli",
         help="extraction engine: 'cli' = local claude CLI / subscription (default), 'api' = Anthropic API key",
     )
+    ap.add_argument("--model", default="",
+                    help="model for the 'cli' engine (e.g. 'sonnet'); default = your claude settings")
     args = ap.parse_args()
 
     load_env_file()
@@ -1020,7 +1036,7 @@ def main() -> None:
             sys.exit(f"ERROR: PDF not found: {pdf}")
         images = render_table_pages(pdf)
         articles = article_pages_text(pdf)
-        data = run_extraction(images, spec, args.engine, articles)
+        data = run_extraction(images, spec, args.engine, articles, args.model)
 
     validate(data, spec)
     log(f"Report date: {data['report_date']}  (Issue {data.get('issue')})")
