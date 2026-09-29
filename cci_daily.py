@@ -544,9 +544,13 @@ def extract_with_api(images: list[tuple[int, bytes]], spec: list[dict], articles
     return data
 
 
-def validate(data: dict, spec: list[dict]) -> None:
+def validate(data: dict, spec: list[dict]) -> list[str]:
+    """Log structural problems; return the ids of sections where EVERY row came
+    back short -- a whole column was skipped (e.g. Sep 28 2026 lost "Basis"),
+    so writing them would shift every value one cell to the left."""
     by_id = {s["id"]: s for s in data.get("sections", [])}
     problems = []
+    shifted = []
     for s in spec:
         got = by_id.get(s["id"])
         if got is None:
@@ -563,10 +567,13 @@ def validate(data: dict, spec: list[dict]) -> None:
                 problems.append(
                     f"{s['id']} row {r['label']!r}: {len(r['values'])} values, expected {ncols}"
                 )
+        if got["rows"] and all(len(r["values"]) < ncols for r in got["rows"]):
+            shifted.append(s["id"])
     if problems:
         for p in problems:
             log(f"  WARNING: {p}")
     dt.date.fromisoformat(data["report_date"])  # raises if malformed
+    return shifted
 
 
 def norm_label(s: str) -> str:
@@ -1038,12 +1045,24 @@ def main() -> None:
         articles = article_pages_text(pdf)
         data = run_extraction(images, spec, args.engine, articles, args.model)
 
-    validate(data, spec)
+    shifted = validate(data, spec)
     log(f"Report date: {data['report_date']}  (Issue {data.get('issue')})")
 
     if args.json:
         Path(args.json).write_text(json.dumps(data, indent=1), encoding="utf-8")
         log(f"Extraction saved: {args.json}")
+
+    # Checked after the save so the extraction isn't lost: it can be fixed by
+    # hand and re-applied with --from-json instead of paying for another call.
+    if shifted:
+        sys.exit(
+            "\n" + "!" * 64 + "\n"
+            f"ERROR: every row is short a value in section(s): {', '.join(shifted)}\n"
+            "A whole column was missed in extraction; writing would shift those\n"
+            "values one column left. Workbook NOT modified. Re-run the PDF, or fix\n"
+            "the saved JSON and re-apply it with --from-json.\n"
+            + "!" * 64
+        )
 
     if args.dry_run:
         log("Dry run: workbook not modified.")
